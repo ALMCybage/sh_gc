@@ -1,0 +1,126 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sequifi
+
+resources:
+  - ../../shared/base
+  - ../../web-api/base
+  - ../../worker/base
+
+# One place to change the deployed version. CI updates these two tags and commits;
+# ArgoCD notices and rolls out. Digests are preferable to tags in prod - a tag is a
+# pointer, a digest is the artefact - and Artifact Registry has immutable_tags on,
+# which closes most of the gap.
+images:
+  - name: REGION-docker.pkg.dev/PROJECT_ID/sequifi/web-api
+    newName: us-central1-docker.pkg.dev/PROJECT_ID/sequifi/web-api
+    newTag: PLACEHOLDER_WEB_TAG
+  - name: REGION-docker.pkg.dev/PROJECT_ID/sequifi/worker
+    newName: us-central1-docker.pkg.dev/PROJECT_ID/sequifi/worker
+    newTag: PLACEHOLDER_WORKER_TAG
+
+configMapGenerator:
+  - name: app-config
+    behavior: create
+    literals:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - APP_NAME=Sequifi
+      - APP_URL=https://acme.sequifi.com
+
+      # The 'gcp' channel emits the severity/message/trace fields Cloud Logging
+      # promotes. The stock JSON formatter writes level_name, which Cloud Logging
+      # ignores - every line, including fatals, would land at DEFAULT severity and no
+      # severity-based alert could fire.
+      - LOG_CHANNEL=gcp
+      - LOG_LEVEL=info
+
+      # The app always talks to the Cloud SQL Auth Proxy sidecar on localhost, so no
+      # DB credential crosses the network and the instance needs no public IP.
+      - CLOUDSQL_INSTANCE=PROJECT_ID:us-central1:sequifi-prod-mysql
+      - DB_CONNECTION=mysql
+      - DB_HOST=127.0.0.1
+      - DB_PORT=3306
+      - DB_DATABASE=tenant_acme
+      - DB_USERNAME=app
+
+      - CACHE_DRIVER=redis
+      - SESSION_DRIVER=redis
+      - REDIS_CLIENT=predis
+      - REDIS_HOST=REDIS_HOST_PLACEHOLDER
+      - REDIS_PORT=6379
+
+      # Host-only cookies. Setting SESSION_DOMAIN to .sequifi.com would let one
+      # tenant's session cookie be sent to another tenant's hostname, which is the
+      # implicit half of the tenancy isolation.
+      - SESSION_SECURE_COOKIE=true
+      - SESSION_SAME_SITE=lax
+      - SANCTUM_STATEFUL_DOMAINS=*.sequifi.com
+
+      - GOOGLE_CLOUD_PROJECT=PROJECT_ID
+      - PUBSUB_DRIVER=rest
+      - PUBSUB_TOPIC_PAYROLL=payroll-calc-events
+      - PUBSUB_TOPIC_SALES=sales-import
+      - FIRESTORE_DRIVER=rest
+      - FIRESTORE_DATABASE=(default)
+      - FIRESTORE_COLLECTION=api_request_statuses
+
+      - TENANCY_HEADER=X-Tenant
+      - TENANCY_BASE_DOMAINS=sequifi.com
+      - TENANCY_SCHEMA_PREFIX=tenant_
+      - TENANCY_FALLBACK_TENANT=acme
+      # The tenant comes from the Host header only. Trusting the client-supplied
+      # header would let a caller aim a request at another tenant's schema.
+      # APP_ENV=production force-disables it anyway; this is defence in depth.
+      - TENANCY_TRUST_HEADER=false
+
+      - RATE_LIMIT_PER_TENANT=600
+      - RATE_LIMIT_PER_CLIENT=120
+
+    files:
+      - TENANTS_JSON=files/tenants.json
+
+  - name: worker-config
+    behavior: create
+    literals:
+      - GOOGLE_CLOUD_PROJECT=PROJECT_ID
+      - LOG_LEVEL=info
+
+      - CLOUDSQL_INSTANCE=PROJECT_ID:us-central1:sequifi-prod-mysql
+      - DB_HOST=127.0.0.1
+      - DB_PORT=3306
+      - DB_USERNAME=app
+
+      # Total connections scale with pods x tenants:
+      #   20 pods x 8 schemas x 4 conns = 640, inside the instance's 2000 budget.
+      - DB_MAX_OPEN_CONNS=4
+      - DB_MAX_IDLE_CONNS=2
+      - DB_MAX_OPEN_SCHEMAS=8
+      - DB_QUERY_TIMEOUT=60s
+
+      - PUBSUB_SUB_PAYROLL=payroll-calc-events-worker
+      - PUBSUB_SUB_SALES=sales-import-worker
+      # Backpressure: each pod leases at most 20. The rest stays in the backlog, which
+      # is exactly the signal the HPA scales on.
+      - PUBSUB_MAX_OUTSTANDING=20
+      - PUBSUB_NUM_GOROUTINES=4
+      - PUBSUB_ACK_EXTENSION=5m
+      # Keep in step with the subscription's max_delivery_attempts.
+      - WORKER_MAX_RETRIES=5
+
+      - STATUS_DRIVER=firestore
+      - FIRESTORE_DATABASE=(default)
+      - FIRESTORE_COLLECTION=api_request_statuses
+
+      - HTTP_ADDR=:8081
+      - SHUTDOWN_TIMEOUT=45s
+      - TENANCY_SCHEMA_PREFIX=tenant_
+
+    files:
+      - TENANTS_JSON=files/tenants.json
+
+patches:
+  - path: patches/service-accounts.yaml
+  - path: patches/external-secrets.yaml
+  - path: patches/replicas.yaml

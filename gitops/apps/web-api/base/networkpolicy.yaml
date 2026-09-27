@@ -1,0 +1,39 @@
+####################################################################
+# The web tier accepts traffic only from the Google load balancer.
+#
+# Those two CIDRs are the documented Google Front End and health-check ranges. With
+# container-native load balancing the LB talks straight to pod IPs, so there is no
+# node or kube-proxy hop to allow - which means the allow-list can be this narrow.
+#
+# Without a policy, any pod in the cluster could reach the API directly and bypass
+# Cloud Armor and the edge rate limits entirely.
+####################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-api-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: web-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 130.211.0.0/22
+        - ipBlock:
+            cidr: 35.191.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # Prometheus scrapes /metrics and Argo Rollouts' analysis needs those metrics to
+    # judge a canary, so a blocked scrape would make every rollout fail its analysis.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080

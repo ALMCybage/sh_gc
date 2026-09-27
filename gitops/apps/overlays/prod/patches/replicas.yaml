@@ -1,0 +1,18 @@
+# Replica counts are the HPA's job at runtime, but the Rollout still needs a starting
+# value. ArgoCD is told to ignore spec.replicas afterwards (see the Application's
+# ignoreDifferences) so it does not fight the HPA on every sync.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: web-api
+  namespace: sequifi
+spec:
+  replicas: 3
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: worker
+  namespace: sequifi
+spec:
+  replicas: 3

@@ -1,0 +1,15 @@
+# The adapter reads Cloud Monitoring, so it needs an identity with
+# roles/monitoring.viewer. Workload Identity again: no key file for the autoscaler
+# either.
+#
+# If this annotation is wrong the adapter starts, registers its APIService, and then
+# returns permission errors for every metric query - which the HPA reports as "unable
+# to fetch metrics" while it quietly stays at minReplicas. That is why
+# "is the HPA scaling?" is step 2 of the queue-not-draining runbook.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: custom-metrics-stackdriver-adapter
+  namespace: custom-metrics
+  annotations:
+    iam.gke.io/gcp-service-account: sequifi-prod-metrics-adapter@PROJECT_ID.iam.gserviceaccount.com

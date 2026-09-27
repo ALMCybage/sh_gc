@@ -1,0 +1,84 @@
+####################################################################
+# kube-prometheus-stack: Prometheus, Alertmanager and Grafana.
+#
+# WHY BOTH THIS AND CLOUD MONITORING
+# Cloud Monitoring owns long-term retention, SLOs and the paging policies (Terraform
+# manages those). This in-cluster Prometheus exists because Argo Rollouts' analysis
+# needs to query metrics synchronously, with second-level freshness, to decide whether
+# a canary is healthy. Cloud Monitoring's ingestion delay is too long for that
+# decision - a canary would be promoted before its failures were visible.
+#
+# So: Prometheus for delivery decisions, Cloud Monitoring for alerting and history.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-platform
+
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: 65.5.1
+
+      helm:
+        releaseName: kube-prometheus-stack
+        valueFiles:
+          - $values/gitops/platform/observability/kube-prometheus-values.yaml
+
+    - repoURL: https://github.com/your-org/sequifi.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+  ignoreDifferences:
+    # The chart's admission webhook mutates its own CA bundle after install.
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jqPathExpressions:
+        - .webhooks[]?.clientConfig.caBundle
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      jqPathExpressions:
+        - .webhooks[]?.clientConfig.caBundle
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sequifi-observability
+  namespace: argocd
+  annotations:
+    # After Prometheus exists, so the PrometheusRule CRD is available.
+    argocd.argoproj.io/sync-wave: "-5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-platform
+
+  # Recording rules, alert rules and Grafana dashboards for this platform.
+  source:
+    repoURL: https://github.com/your-org/sequifi.git
+    targetRevision: main
+    path: gitops/platform/observability/rules
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }

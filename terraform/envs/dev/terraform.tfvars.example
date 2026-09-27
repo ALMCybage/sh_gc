@@ -1,0 +1,26 @@
+# Copy to terraform.tfvars and fill in. Never commit the real file.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   terraform init -backend-config="bucket=<project>-sequifi-tfstate"
+#   terraform apply
+
+project_id  = "my-gcp-project-dev"
+region      = "us-central1"
+base_domain = "dev.sequifi.com"
+
+# Restrict who can reach the Kubernetes API. Leaving this empty is safe (nothing
+# outside Google can reach it) but blocks your own kubectl too.
+master_authorized_networks = [
+  # { cidr_block = "203.0.113.0/24", display_name = "office egress" },
+]
+
+# Slack only in dev. Paging from a dev cluster is how alerting gets muted for real.
+# slack_webhook_url = "https://hooks.slack.com/services/..."
+
+# Enables the CI identity via OIDC federation, so no service-account key is needed.
+# github_repository = "your-org/sequifi"
+
+# Populated on the SECOND apply, after the workload has created the NEGs:
+#   gcloud compute network-endpoint-groups list \
+#     --filter="name=web-api-neg" --format="value(selfLink)"
+api_neg_self_links = []

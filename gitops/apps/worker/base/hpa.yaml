@@ -1,0 +1,87 @@
+####################################################################
+# Autoscaling on queue depth, not CPU.
+#
+# CPU is a lagging signal for a queue consumer: by the time it rises the backlog is
+# already deep and callers are already waiting. num_undelivered_messages is the
+# leading signal, and the target reads as "keep at most ~10 unprocessed messages per
+# pod".
+#
+# Requires the Custom Metrics Stackdriver Adapter (installed by the platform
+# Application). If the adapter is down the HPA cannot see the backlog at all and sits
+# at minReplicas while the queue grows - which is why "is the HPA scaling?" is step 2
+# of the queue-not-draining runbook.
+####################################################################
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: worker
+
+  minReplicas: 3
+  maxReplicas: 20
+
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: pubsub.googleapis.com|subscription|num_undelivered_messages
+          selector:
+            matchLabels:
+              resource.labels.subscription_id: payroll-calc-events-worker
+        target:
+          type: AverageValue
+          averageValue: "10"
+
+    - type: External
+      external:
+        metric:
+          name: pubsub.googleapis.com|subscription|num_undelivered_messages
+          selector:
+            matchLabels:
+              resource.labels.subscription_id: sales-import-worker
+        target:
+          type: AverageValue
+          averageValue: "10"
+
+    # Safety net for the case where the backlog is small but each message is
+    # expensive - a single 10,000-employee payroll run is one message.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 5
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Long window: removing a pod mid-payroll-run means the message is redelivered
+      # and the work is redone elsewhere. Scaling down slowly is cheaper than that.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: worker

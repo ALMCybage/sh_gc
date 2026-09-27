@@ -1,0 +1,64 @@
+####################################################################
+# Two Services, because a canary needs its own.
+#
+# web-api        - the stable service; carries the standalone NEG annotation that the
+#                  Terraform-managed load balancer attaches to.
+# web-api-canary - selects only canary pods, so the AnalysisTemplates can query
+#                  metrics for the NEW revision in isolation. Measuring both together
+#                  would drown a 5% canary's failures in 95% healthy traffic.
+####################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-api
+  labels:
+    app: web-api
+  annotations:
+    # Standalone NEG: named explicitly so terraform/modules/edge can attach it.
+    # Note there is no "ingress": true - nothing in the cluster manages the LB,
+    # because the GKE Ingress controller cannot put a GCS backend bucket on the same
+    # load balancer as the pods.
+    cloud.google.com/neg: '{"exposed_ports": {"80": {"name": "web-api-neg"}}}'
+spec:
+  type: ClusterIP
+  selector:
+    app: web-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-api-canary
+  labels:
+    app: web-api
+    role: canary
+spec:
+  type: ClusterIP
+  # Argo Rollouts injects the rollouts-pod-template-hash selector at runtime so this
+  # matches only the canary ReplicaSet.
+  selector:
+    app: web-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-api-metrics
+  labels:
+    app: web-api
+spec:
+  clusterIP: None
+  selector:
+    app: web-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

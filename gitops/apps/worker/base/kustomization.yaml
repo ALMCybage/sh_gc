@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sequifi
+
+labels:
+  # includeSelectors: false is important. Adding these to the Rollout's selector would
+  # make it a different selector than the running one, and a selector change forces a
+  # full replace rather than a canary.
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: sequifi
+      app.kubernetes.io/name: worker
+
+resources:
+  - serviceaccount.yaml
+  - rollout.yaml
+  - hpa.yaml
+  - monitoring.yaml
+
+images:
+  - name: worker
+    newName: REGION-docker.pkg.dev/PROJECT_ID/sequifi/worker
+    newTag: latest

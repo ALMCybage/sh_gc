@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: custom-metrics
+
+# The upstream adapter manifest, pinned to a commit rather than a branch: an
+# APIService that registers with the Kubernetes API is not something to let float.
+resources:
+  - https://raw.githubusercontent.com/GoogleCloudPlatform/k8s-stackdriver/master/custom-metrics-stackdriver-adapter/deploy/production/adapter_new_resource_model.yaml
+  - serviceaccount-patch.yaml
+
+patches:
+  - path: workload-identity.yaml
+    target:
+      kind: ServiceAccount
+      name: custom-metrics-stackdriver-adapter

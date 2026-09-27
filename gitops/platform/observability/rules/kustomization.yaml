@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: monitoring
+
+resources:
+  - recording-rules.yaml
+  - alerts.yaml
+
+configMapGenerator:
+  # Grafana's sidecar discovers dashboards by this label, so a dashboard is a reviewed
+  # file in Git rather than something edited in the UI and lost on the next restart.
+  - name: sequifi-dashboards
+    files:
+      - async-pipeline.json=dashboards/async-pipeline.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+
+generatorOptions:
+  disableNameSuffixHash: true

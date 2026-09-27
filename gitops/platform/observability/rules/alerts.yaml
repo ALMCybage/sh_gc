@@ -1,0 +1,202 @@
+####################################################################
+# Alert rules for the async pipeline.
+#
+# These complement the Cloud Monitoring policies in terraform/modules/monitoring rather
+# than duplicating them. The split:
+#
+#   Cloud Monitoring  - GCP-side signals it is the only thing that sees (Pub/Sub
+#                       backlog, Cloud SQL health, the load balancer, log-based
+#                       metrics) and the SLO burn rate. Outside the cluster's failure
+#                       domain, so it can still page when the cluster is the problem.
+#
+#   Prometheus (here) - in-cluster signals Cloud Monitoring does not have at useful
+#                       resolution: the worker's own counters, pod state, and the
+#                       ratios that only make sense from application metrics.
+#
+# Every rule carries a runbook_url. An alert without one is a puzzle handed to someone
+# who has just been woken up.
+####################################################################
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sequifi-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # ---------------------------------------------------------------
+    - name: sequifi.worker
+      interval: 30s
+      rules:
+        - alert: WorkerPoolDown
+          expr: |
+            sum(up{job=~".*worker.*"}) == 0
+            or absent(up{job=~".*worker.*"})
+          for: 2m
+          labels:
+            severity: critical
+            component: worker
+          annotations:
+            summary: "No worker pods are reporting"
+            description: >-
+              Every worker pod is gone or unscrapeable. Payroll runs and sales imports
+              are still being ACCEPTED (the web tier returns 202 regardless) but
+              nothing is processing them, so callers see requests stuck in QUEUED.
+              Pub/Sub retains the work for 7 days, so nothing is lost yet.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/worker-pool-down.md"
+
+        - alert: WorkerHighFailureRate
+          expr: |
+            (
+              sum(rate(worker_messages_failed_total[5m]))
+              /
+              clamp_min(sum(rate(worker_messages_received_total[5m])), 0.001)
+            ) > 0.2
+          for: 5m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: "Over 20% of leased messages are being nacked"
+            description: >-
+              The worker is leasing work and failing it transiently. Messages are
+              redelivered so nothing is lost, but throughput collapses and the same
+              work is being done repeatedly. Usually Cloud SQL contention or a
+              dependency timing out.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/worker-high-failure-rate.md"
+
+        - alert: WorkerPermanentFailures
+          expr: sum(rate(worker_messages_permanent_failed_total[10m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: "Requests are being rejected as unprocessable"
+            description: >-
+              The worker is marking requests FAILED without retrying - a bad payload,
+              an unknown tenant, or a referential integrity violation. A steady trickle
+              means a client is sending something the API accepts but the worker
+              rejects, which is a validation gap worth closing rather than a transient
+              fault.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/worker-permanent-failures.md"
+
+        # Duplicates are NORMAL: Pub/Sub is at-least-once and the idempotency guard
+        # exists precisely to absorb them. A high RATE is the signal - it means
+        # messages are being redelivered because acks are not landing, so the same work
+        # is repeatedly leased and discarded.
+        - alert: WorkerExcessiveDuplicates
+          expr: |
+            (
+              sum(rate(worker_messages_duplicate_total[10m]))
+              /
+              clamp_min(sum(rate(worker_messages_received_total[10m])), 0.001)
+            ) > 0.3
+          for: 15m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: "Over 30% of deliveries are duplicates"
+            description: >-
+              The idempotency guard is absorbing these correctly, so no work is done
+              twice - but a third of the pool's effort is wasted on redeliveries. Most
+              often the ack deadline is being exceeded because handlers now take longer
+              than PUBSUB_ACK_EXTENSION allows.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/worker-duplicates.md"
+
+        # Every eviction costs a reconnect on that tenant's next message. A high rate
+        # means DB_MAX_OPEN_SCHEMAS is too low for how many tenants this pod serves.
+        - alert: WorkerPoolThrashing
+          expr: sum(rate(worker_tenant_pool_evictions_total[10m])) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            component: worker
+          annotations:
+            summary: "Tenant connection pools are being evicted constantly"
+            description: >-
+              The LRU cap on per-tenant pools is too small for the number of tenants
+              this pod is handling, so nearly every message pays a reconnect. Raise
+              DB_MAX_OPEN_SCHEMAS, but check Cloud SQL connection headroom first -
+              the cap exists to stop connection exhaustion, which is a worse failure.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/worker-pool-thrashing.md"
+
+    # ---------------------------------------------------------------
+    - name: sequifi.web
+      interval: 30s
+      rules:
+        - alert: WebApiPodsUnavailable
+          expr: |
+            kube_deployment_status_replicas_available{namespace="sequifi"} == 0
+            or (
+              sum(kube_pod_status_ready{namespace="sequifi", condition="true"}
+                * on(pod) group_left kube_pod_labels{label_app="web-api"}) == 0
+            )
+          for: 2m
+          labels:
+            severity: critical
+            component: web
+          annotations:
+            summary: "No web API pods are ready"
+            description: >-
+              Every web pod is failing readiness, so the load balancer has no healthy
+              backends and the platform returns 502. Readiness checks Cloud SQL, Redis
+              and Firestore individually - /readyz on a surviving pod names which one.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/web-pods-unavailable.md"
+
+        - alert: WebApiCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="sequifi"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+            component: web
+          annotations:
+            summary: "{{ $labels.pod }} is restarting repeatedly"
+            description: >-
+              A container has restarted more than three times in 15 minutes. For the
+              web tier the usual cause is the entrypoint failing to warm its caches,
+              which happens when a config value is missing or wrong - the pod exits
+              deliberately rather than serving broken responses.
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/crash-looping.md"
+
+    # ---------------------------------------------------------------
+    - name: sequifi.delivery
+      interval: 1m
+      rules:
+        # A rollout that aborted took the platform back to the previous revision, which
+        # is the system working as designed - but somebody still has to know a deploy
+        # failed and why.
+        - alert: RolloutAborted
+          expr: |
+            rollout_info{phase="Degraded"} == 1
+          for: 2m
+          labels:
+            severity: warning
+            component: delivery
+          annotations:
+            summary: "Rollout {{ $labels.name }} aborted"
+            description: >-
+              The canary analysis failed and Argo Rollouts rolled back. The previous
+              revision is serving, so there is no user impact - but the deploy did not
+              land. Check which AnalysisRun failed and why:
+              kubectl argo rollouts get rollout {{ $labels.name }} -n sequifi
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/rollout-aborted.md"
+
+        - alert: RolloutStuckPaused
+          expr: |
+            rollout_info{phase="Paused"} == 1
+          for: 2h
+          labels:
+            severity: info
+            component: delivery
+          annotations:
+            summary: "Rollout {{ $labels.name }} has been paused for 2 hours"
+            description: >-
+              The canary is waiting at the manual gate before 100% of traffic moves.
+              Not a fault - but a half-promoted rollout means two revisions are serving,
+              which complicates any other incident. Promote or abort:
+              kubectl argo rollouts promote {{ $labels.name }} -n sequifi
+            runbook_url: "https://github.com/your-org/sequifi/blob/main/docs/runbook/rollout-paused.md"

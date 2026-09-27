@@ -1,0 +1,92 @@
+####################################################################
+# AppProjects: the blast radius of a GitOps mistake.
+#
+# Without a project, every Application can deploy any resource to any namespace from
+# any repository. A typo in a path, or a compromised repo, becomes cluster-wide. These
+# projects restrict what each Application may create and where.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sequifi-platform
+  namespace: argocd
+  finalizers:
+    # Ensures child Applications are cleaned up rather than orphaned when the project
+    # is deleted.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Cluster addons (Rollouts, Prometheus, External Secrets, metrics adapter)
+
+  sourceRepos:
+    - https://github.com/your-org/sequifi.git
+    - https://argoproj.github.io/argo-helm
+    - https://prometheus-community.github.io/helm-charts
+    - https://charts.external-secrets.io
+
+  destinations:
+    - namespace: argo-rollouts
+      server: https://kubernetes.default.svc
+    - namespace: monitoring
+      server: https://kubernetes.default.svc
+    - namespace: external-secrets
+      server: https://kubernetes.default.svc
+    - namespace: custom-metrics
+      server: https://kubernetes.default.svc
+    - namespace: kube-system
+      server: https://kubernetes.default.svc
+
+  # Addons legitimately need cluster-scoped resources (CRDs, ClusterRoles, APIServices).
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sequifi-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: The Sequifi application (web API and worker)
+
+  sourceRepos:
+    - https://github.com/your-org/sequifi.git
+
+  destinations:
+    - namespace: sequifi
+      server: https://kubernetes.default.svc
+
+  # The application project may create almost nothing cluster-scoped. It does need
+  # Namespace (it creates its own) but explicitly must NOT be able to create
+  # ClusterRoles or bindings - a compromised app repo should not be able to grant
+  # itself cluster-admin.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+
+  clusterResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Who may sync this project by hand. Everything else is automated.
+  roles:
+    - name: deployer
+      description: Trigger a sync and promote a rollout
+      policies:
+        - p, proj:sequifi-apps:deployer, applications, sync, sequifi-apps/*, allow
+        - p, proj:sequifi-apps:deployer, applications, get, sequifi-apps/*, allow
+      groups:
+        - your-org:platform-team

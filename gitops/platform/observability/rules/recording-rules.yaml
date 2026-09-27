@@ -1,0 +1,73 @@
+####################################################################
+# Recording rules.
+#
+# Two purposes:
+#
+# 1. Argo Rollouts' AnalysisTemplates query these instead of raw expressions. A canary
+#    decision should not depend on getting a multi-line PromQL expression right inside
+#    a YAML string - and a pre-computed rule can be graphed and sanity-checked before
+#    it is trusted to gate a deploy.
+#
+# 2. The dashboards read them, so a panel and an alert cannot disagree about what
+#    "success rate" means.
+####################################################################
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sequifi-recording-rules
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: sequifi.worker.recording
+      interval: 30s
+      rules:
+        - record: sequifi:worker_throughput:rate5m
+          expr: sum(rate(worker_messages_completed_total[5m]))
+
+        # clamp_min avoids a divide-by-zero producing NaN when the queue is idle. NaN
+        # fails a successCondition comparison, which would abort a perfectly healthy
+        # canary purely because no work happened to arrive during the analysis window.
+        - record: sequifi:worker_success_ratio:rate5m
+          expr: |
+            (
+              sum(rate(worker_messages_completed_total[5m]))
+              + sum(rate(worker_messages_duplicate_total[5m]))
+            )
+            /
+            clamp_min(sum(rate(worker_messages_received_total[5m])), 0.001)
+
+        - record: sequifi:worker_failure_ratio:rate5m
+          expr: |
+            (
+              sum(rate(worker_messages_failed_total[5m]))
+              + sum(rate(worker_messages_permanent_failed_total[5m]))
+            )
+            /
+            clamp_min(sum(rate(worker_messages_received_total[5m])), 0.001)
+
+        - record: sequifi:worker_mean_duration_ms
+          expr: avg(worker_event_duration_ms_avg) by (event_type)
+
+        # How saturated the pool is. In-flight approaching pods x MaxOutstanding means
+        # every pod is at its lease limit and the HPA should be adding more.
+        - record: sequifi:worker_inflight:sum
+          expr: sum(worker_messages_in_flight)
+
+        - record: sequifi:worker_pool_utilisation:ratio
+          expr: |
+            sum(worker_tenant_pools_open)
+            /
+            clamp_min(sum(worker_tenant_pools_max), 1)
+
+    - name: sequifi.web.recording
+      interval: 30s
+      rules:
+        - record: sequifi:web_pods_ready:count
+          expr: |
+            sum(kube_pod_status_ready{namespace="sequifi", condition="true"})
+
+        - record: sequifi:web_restarts:increase15m
+          expr: |
+            sum(increase(kube_pod_container_status_restarts_total{namespace="sequifi"}[15m]))

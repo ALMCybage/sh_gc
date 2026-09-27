@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sequifi
+  labels:
+    app.kubernetes.io/part-of: sequifi
+    # Lets NetworkPolicies in other namespaces select this one by name.
+    kubernetes.io/metadata.name: sequifi
+---
+# Autopilot bills per pod request, so a namespace quota is the cheapest guard against
+# a bad HPA setting or a runaway rollout emptying the budget. The ceiling is set above
+# the sum of both HPAs' maxReplicas so legitimate peak scaling is never blocked.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: sequifi-quota
+  namespace: sequifi
+spec:
+  hard:
+    requests.cpu: "40"
+    requests.memory: 80Gi
+    limits.cpu: "60"
+    limits.memory: 120Gi
+    pods: "120"
+---
+# Egress is not restricted here, but ingress to the application pods is (see each
+# app's NetworkPolicy). This default-deny makes the intent explicit rather than
+# relying on the absence of a policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: sequifi
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress

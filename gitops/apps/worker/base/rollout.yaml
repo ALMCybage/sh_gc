@@ -1,0 +1,166 @@
+####################################################################
+# Go Microservice Worker Pool - the calculation engine.
+#
+# No Service, no Ingress, no inbound traffic. It pulls from Pub/Sub, so scaling is
+# driven by subscription backlog rather than request rate and the pods are invisible
+# to the load balancer.
+#
+# The canary strategy is different from the web tier's for the same reason: there is
+# no traffic to shift. "Canary" here means a small number of new-revision pods leasing
+# real messages alongside the old ones, judged on whether they COMPLETE work rather
+# than on latency.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: worker
+  labels:
+    app: worker
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+
+  selector:
+    matchLabels:
+      app: worker
+
+  strategy:
+    canary:
+      analysis:
+        templates:
+          - templateName: worker-processing-health
+        startingStep: 1
+        args:
+          - name: namespace
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+      steps:
+        # One pod's worth. It competes for messages with the stable pods, so a broken
+        # revision fails a small share of work rather than all of it - and the
+        # idempotency guard means anything it nacks is retried by a healthy pod.
+        - setCanaryScale:
+            replicas: 1
+        - pause: { duration: 3m }
+
+        - setCanaryScale:
+            replicas: 2
+        - pause: { duration: 5m }
+
+        - setCanaryScale:
+            matchTrafficWeight: false
+            replicas: 3
+
+      scaleDownDelaySeconds: 30
+
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      serviceAccountName: worker
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # On SIGTERM the worker stops leasing and drains what it holds. Anything it
+      # cannot finish is nacked and redelivered elsewhere, so this is about avoiding
+      # rework rather than correctness - but redoing a 5,000-employee payroll run is
+      # rework worth avoiding.
+      terminationGracePeriodSeconds: 60
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: worker
+
+      initContainers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args:
+            - "--private-ip"
+            - "--structured-logs"
+            - "--port=3306"
+            # Longer than the app's grace period so the proxy outlives the last query.
+            - "--max-sigterm-delay=50s"
+            - "$(CLOUDSQL_INSTANCE)"
+          env:
+            - name: CLOUDSQL_INSTANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: worker-config
+                  key: CLOUDSQL_INSTANCE
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+      containers:
+        - name: worker
+          image: worker # replaced by kustomize
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: probe
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: worker-config
+            - secretRef:
+                name: app-secrets
+          env:
+            # Every log line and every payroll_runs.processed_by value carries the pod
+            # name, so a bad calculation can be traced back to a specific pod - and to
+            # a specific revision during a canary.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['rollouts-pod-template-hash']
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probe
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probe
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3

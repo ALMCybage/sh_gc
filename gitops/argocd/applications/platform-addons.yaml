@@ -1,0 +1,157 @@
+####################################################################
+# Cluster addons.
+#
+# Sync waves matter here. Argo Rollouts must exist before the application's Rollout
+# resources, and External Secrets before the Secret the pods mount - otherwise the
+# first sync fails with "no matches for kind" or pods crash-loop on a missing secret,
+# and someone has to re-sync by hand.
+#
+#   wave -20  CRDs and operators   (Rollouts, External Secrets)
+#   wave -10  observability         (Prometheus, metrics adapter)
+#   wave   0  the application       (see application.yaml)
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argo-rollouts
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-20"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-platform
+
+  source:
+    repoURL: https://argoproj.github.io/argo-helm
+    chart: argo-rollouts
+    targetRevision: 2.38.0
+
+    helm:
+      releaseName: argo-rollouts
+      values: |
+        controller:
+          replicas: 2
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          metrics:
+            enabled: true
+            serviceMonitor:
+              enabled: true
+              additionalLabels:
+                release: kube-prometheus-stack
+
+        # The dashboard makes a paused canary visible to people who do not live in
+        # kubectl. Read-only, and not exposed outside the cluster.
+        dashboard:
+          enabled: true
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+
+        # Autopilot rejects pods without a security context.
+        podSecurityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argo-rollouts
+
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      # CRDs can exceed the annotation size limit that client-side apply uses.
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-secrets
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-20"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-platform
+
+  source:
+    repoURL: https://charts.external-secrets.io
+    chart: external-secrets
+    targetRevision: 0.10.5
+
+    helm:
+      releaseName: external-secrets
+      values: |
+        installCRDs: true
+        replicaCount: 2
+
+        # Reads Secret Manager through Workload Identity, so there is no key file for
+        # the secrets operator either.
+        serviceAccount:
+          create: true
+          name: external-secrets
+
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+          limits:   { cpu: 500m, memory: 512Mi }
+
+        webhook:
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+
+        certController:
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+
+        serviceMonitor:
+          enabled: true
+          additionalLabels:
+            release: kube-prometheus-stack
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: external-secrets
+
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: custom-metrics-adapter
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-platform
+
+  # The worker's HPA scales on Pub/Sub backlog, which is a Cloud Monitoring metric.
+  # Without this adapter the HPA cannot read it and sits at minReplicas while the queue
+  # grows - a failure that looks like "the worker is slow" rather than "the autoscaler
+  # is blind".
+  source:
+    repoURL: https://github.com/your-org/sequifi.git
+    targetRevision: main
+    path: gitops/platform/custom-metrics-adapter
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: custom-metrics
+
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

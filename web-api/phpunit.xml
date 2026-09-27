@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="./vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         failOnWarning="true"
+         failOnRisky="true">
+    <testsuites>
+        <testsuite name="Unit">
+            <directory suffix="Test.php">./tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory suffix="Test.php">./tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <coverage processUncoveredFiles="true">
+        <include>
+            <directory suffix=".php">./app</directory>
+        </include>
+    </coverage>
+    <!--
+        force="true" on every variable, deliberately.
+
+        Without it PHPUnit leaves an already-exported environment variable alone,
+        so a developer who has sourced a local dev profile (or a CI runner with
+        stray exports) gets a different test configuration than everyone else. That
+        produced a genuinely confusing failure here: SANCTUM_STATEFUL_DOMAINS was
+        inherited from a shell, Sanctum stopped treating test requests as
+        first-party, and every authenticated test failed with "Session store not
+        set on request" - an error that says nothing about the real cause.
+
+        The test suite must be hermetic.
+    -->
+    <php>
+        <env name="APP_ENV" value="testing" force="true"/>
+        <env name="APP_KEY" value="base64:RED6Ged84lgnWPYitrlp2BeWgka3/uUJ6QagCcH/nXI=" force="true"/>
+        <env name="APP_DEBUG" value="true" force="true"/>
+        <env name="BCRYPT_ROUNDS" value="4" force="true"/>
+
+        <!-- Tenant schemas are SQLite files created per test by TestCase. -->
+        <env name="DB_CONNECTION" value="sqlite" force="true"/>
+        <env name="TENANCY_TEMPLATE_CONNECTION" value="sqlite" force="true"/>
+        <env name="DB_DATABASE" value=":memory:" force="true"/>
+
+        <!-- Array drivers so tests need no Redis. Each test gets a clean store. -->
+        <env name="CACHE_DRIVER" value="array" force="true"/>
+        <env name="SESSION_DRIVER" value="array" force="true"/>
+        <env name="QUEUE_CONNECTION" value="sync" force="true"/>
+        <env name="MAIL_MAILER" value="array" force="true"/>
+        <env name="LOG_CHANNEL" value="null" force="true"/>
+
+        <!-- No GCP in tests: envelopes go to the log publisher and are asserted on. -->
+        <env name="PUBSUB_DRIVER" value="log" force="true"/>
+        <env name="FIRESTORE_DRIVER" value="cache" force="true"/>
+        <env name="FIRESTORE_EMULATOR_HOST" value="" force="true"/>
+        <env name="PUBSUB_EMULATOR_HOST" value="" force="true"/>
+        <env name="GOOGLE_CLOUD_PROJECT" value="test-project" force="true"/>
+
+        <env name="TENANCY_BASE_DOMAINS" value="sequifi.com" force="true"/>
+        <!-- OFF in tests. TenancyIsolationTest asserts the header is ignored, which
+             is the regression guard for the cross-tenant hole. -->
+        <env name="TENANCY_TRUST_HEADER" value="false" force="true"/>
+        <env name="SANCTUM_STATEFUL_DOMAINS" value="*.sequifi.com" force="true"/>
+        <env name="SESSION_DOMAIN" value="" force="true"/>
+        <env name="SESSION_SECURE_COOKIE" value="false" force="true"/>
+    </php>
+</phpunit>

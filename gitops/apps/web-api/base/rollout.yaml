@@ -1,0 +1,251 @@
+####################################################################
+# Stateless Core Web API - an Argo Rollout, not a Deployment.
+#
+# WHY A ROLLOUT
+# A Deployment's rolling update is blind: it replaces pods on a schedule and has no
+# idea whether the new ones are serving correctly. For a payroll API the interesting
+# failures are the ones that only appear under real traffic - a bad config value, a
+# missing migration, a dependency the new revision cannot reach. A canary with
+# automated analysis catches those in the first 5% of traffic and rolls back on its
+# own, instead of waiting for someone to notice.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: web-api
+  labels:
+    app: web-api
+    app.kubernetes.io/component: web
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+
+  selector:
+    matchLabels:
+      app: web-api
+
+  strategy:
+    canary:
+      canaryService: web-api-canary
+      stableService: web-api
+
+      # Analysis runs alongside the canary for its whole life, aborting the rollout
+      # the moment error rate or latency degrades - not just at the step boundaries.
+      analysis:
+        templates:
+          - templateName: web-api-success-rate
+          - templateName: web-api-latency
+        startingStep: 1
+        args:
+          - name: canary-service
+            value: web-api-canary
+          - name: namespace
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+      steps:
+        # 5% first: enough traffic for the analysis to be statistically meaningful,
+        # small enough that a bad revision affects few users.
+        - setWeight: 5
+        - pause: { duration: 2m }
+
+        - setWeight: 25
+        - pause: { duration: 5m }
+
+        - setWeight: 50
+        # An explicit human gate before the majority of traffic moves. Removing this
+        # is a reasonable choice once the analysis has earned trust; keeping it is the
+        # right default for something that touches payroll.
+        - pause: {}
+
+        - setWeight: 100
+
+      trafficRouting:
+        # The GCP load balancer splits by backend service weight, which Argo Rollouts
+        # cannot program directly. Without a service mesh, setWeight is approximated
+        # by pod count: 5% weight means roughly 5% of the pods behind the same NEG.
+        # Good enough for canary analysis; a mesh (or the Gateway API) would give
+        # exact weights.
+        managedRoutes: []
+
+      # Keep the previous ReplicaSet warm briefly so an abort is instant rather than
+      # a cold start.
+      scaleDownDelaySeconds: 60
+
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+
+  template:
+    metadata:
+      labels:
+        app: web-api
+      annotations:
+        # Rolls the pods when config changes. Kustomize's configMapGenerator suffixes
+        # the ConfigMap name with a hash, so this is belt and braces for values that
+        # arrive from elsewhere.
+        checksum/config: "kustomize-managed"
+    spec:
+      serviceAccountName: web-api
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: web-api
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Must exceed the load balancer's connection-draining timeout (45s), or pods
+      # are killed while the LB is still sending them traffic.
+      terminationGracePeriodSeconds: 60
+
+      initContainers:
+        # Native sidecar: starts before the app containers and shuts down after them,
+        # so the proxy is up before the first query and still up while the app drains.
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args:
+            - "--private-ip"
+            - "--structured-logs"
+            - "--port=3306"
+            - "--max-sigterm-delay=45s"
+            - "$(CLOUDSQL_INSTANCE)"
+          env:
+            - name: CLOUDSQL_INSTANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: CLOUDSQL_INSTANCE
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+      containers:
+        - name: php-fpm
+          image: web-api # replaced by kustomize
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: fastcgi
+              containerPort: 9000
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['rollouts-pod-template-hash']
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            # www-data in the php:8.2-fpm-alpine base image.
+            runAsUser: 82
+            runAsGroup: 82
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            exec:
+              command: ["php", "-r", "exit(0);"]
+            failureThreshold: 20
+            periodSeconds: 3
+
+        - name: nginx
+          # The unprivileged variant: runs as uid 101 and binds 8080, which is what
+          # lets the pod keep runAsNonRoot.
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+
+          # Liveness touches no dependency: a Memorystore or Cloud SQL blip must not
+          # restart otherwise-healthy pods.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Readiness DOES check dependencies, so a pod that cannot serve leaves the
+          # NEG instead of returning 500s through the load balancer.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                # Let the load balancer notice the endpoint is going away before nginx
+                # stops accepting. Without this pause, in-flight requests are cut off
+                # mid-rollout and surface at the edge as 502s.
+                command: ["sh", "-c", "sleep 15; nginx -s quit"]
+
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: nginx-conf
+        - name: nginx-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

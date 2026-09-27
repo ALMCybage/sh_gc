@@ -1,0 +1,285 @@
+# Local stand-in for the GCP architecture.
+#
+#   nginx             -> the load balancer URL map: SPA from disk, /api to php-fpm
+#   php-fpm (web-api) -> Stateless Core Web API pod
+#   worker            -> Go Microservice Worker Pod Pool
+#   mysql             -> Cloud SQL for MySQL (one schema per tenant)
+#   redis             -> Memorystore (sessions, cache, idempotency claims)
+#   pubsub-emulator   -> Cloud Pub/Sub
+#   firestore-emulator-> Cloud Firestore
+#
+# One command:  make up      (or  .\dev.ps1 up  on Windows)
+# Then browse:  http://acme.localhost:8080
+#
+name: sequifi-local
+
+x-tenant-registry: &tenant-registry |
+  {
+    "acme":        {"name": "Acme Corp",    "database": "tenant_acme",        "domain": "acme.sequifi.com"},
+    "whiteknight": {"name": "White Knight", "database": "tenant_whiteknight", "domain": "whiteknight.sequifi.com"},
+    "frdm":        {"name": "FRDM",         "database": "tenant_frdm",        "domain": "frdm.sequifi.com"}
+  }
+
+x-db-env: &db-env
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_USERNAME: app
+  DB_PASSWORD: secret
+
+services:
+  ##################################################################
+  # Cloud SQL for MySQL (shared instance, one schema per tenant)
+  ##################################################################
+  mysql:
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # The app tier and the worker both operate in UTC.
+      - --default-time-zone=+00:00
+      # Local instances default to 151; the worker opens a pool per tenant schema.
+      - --max-connections=300
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/docker/mysql-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ##################################################################
+  # Memorystore (Redis) - sessions, cache, idempotency claims
+  ##################################################################
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ##################################################################
+  # Cloud Pub/Sub emulator
+  ##################################################################
+  pubsub-emulator:
+    image: google/cloud-sdk:emulators
+    command:
+      - gcloud
+      - beta
+      - emulators
+      - pubsub
+      - start
+      - --project=local-dev
+      - --host-port=0.0.0.0:8085
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8085/v1/projects/local-dev/topics"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: creates the two topics, their worker subscriptions and the DLQ.
+  pubsub-init:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      pubsub-emulator:
+        condition: service_started
+    environment:
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      GOOGLE_CLOUD_PROJECT: local-dev
+    volumes:
+      - ./scripts/bootstrap-pubsub.sh:/bootstrap.sh:ro
+    entrypoint: ["sh", "/bootstrap.sh"]
+    restart: on-failure
+
+  ##################################################################
+  # Cloud Firestore emulator - API request status tracking
+  ##################################################################
+  firestore-emulator:
+    image: google/cloud-sdk:emulators
+    command:
+      - gcloud
+      - emulators
+      - firestore
+      - start
+      - --project=local-dev
+      - --host-port=0.0.0.0:8086
+    ports:
+      - "8086:8086"
+
+  ##################################################################
+  # Build the SPA into a volume that nginx serves.
+  #
+  # Stands in for `deploy-frontend.sh` publishing to the GCS bucket. Runs to
+  # completion, then nginx starts; the SPA is static, so there is nothing to keep
+  # running (which is exactly the point of that tier).
+  ##################################################################
+  frontend-build:
+    image: node:22-alpine
+    working_dir: /app
+    command: >
+      sh -c "npm ci --no-audit --no-fund && npm run build && rm -rf /out/* && cp -r dist/* /out/"
+    volumes:
+      - ./frontend:/app
+      - frontend-dist:/out
+      - frontend-node-modules:/app/node_modules
+
+  ##################################################################
+  # Stateless Core Web API (PHP Laravel 9, php-fpm)
+  ##################################################################
+  web-api:
+    build:
+      context: ./web-api
+    environment:
+      <<: *db-env
+      APP_NAME: "Sequifi Web API"
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_KEY: base64:RED6Ged84lgnWPYitrlp2BeWgka3/uUJ6QagCcH/nXI=
+      APP_URL: http://acme.localhost:8080
+      LOG_CHANNEL: gcp
+      LOG_LEVEL: debug
+
+      DB_CONNECTION: mysql
+      DB_DATABASE: tenant_acme
+
+      CACHE_DRIVER: redis
+      SESSION_DRIVER: redis
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "null"
+
+      GOOGLE_CLOUD_PROJECT: local-dev
+      PUBSUB_DRIVER: rest
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      PUBSUB_TOPIC_PAYROLL: payroll-calc-events
+      PUBSUB_TOPIC_SALES: sales-import
+      FIRESTORE_DRIVER: rest
+      FIRESTORE_EMULATOR_HOST: firestore-emulator:8086
+      FIRESTORE_COLLECTION: api_request_statuses
+
+      TENANTS_JSON: *tenant-registry
+      TENANCY_BASE_DOMAINS: sequifi.com,localhost
+      TENANCY_FALLBACK_TENANT: acme
+      # Local convenience only: -H 'X-Tenant: acme' instead of a Host header.
+      # Force-disabled when APP_ENV=production.
+      TENANCY_TRUST_HEADER: "true"
+
+      SESSION_DOMAIN: "null"
+      SESSION_SECURE_COOKIE: "false"
+      SANCTUM_STATEFUL_DOMAINS: "*.localhost,*.localhost:8080,*.localhost:5173,localhost:8080,localhost:5173"
+    ports:
+      # Published here rather than on the nginx service because nginx shares this
+      # container's network namespace, the same way a sidecar shares a pod's.
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pubsub-init:
+        condition: service_completed_successfully
+      firestore-emulator:
+        condition: service_started
+
+  nginx:
+    # The unprivileged variant, same as the GKE sidecar (uid 101, binds 8080).
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    # Same network namespace as web-api, so `upstream php { 127.0.0.1:9000 }` works
+    # identically here and in the GKE pod.
+    network_mode: "service:web-api"
+    volumes:
+      - ./deploy/docker/nginx-local.conf:/etc/nginx/nginx.conf:ro
+      - frontend-dist:/var/www/frontend:ro
+    depends_on:
+      web-api:
+        condition: service_started
+      frontend-build:
+        condition: service_completed_successfully
+
+  ##################################################################
+  # Go Microservice Worker Pool (calculation engine)
+  ##################################################################
+  worker:
+    build:
+      context: ./worker-go
+    environment:
+      <<: *db-env
+      GOOGLE_CLOUD_PROJECT: local-dev
+      LOG_LEVEL: debug
+
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      PUBSUB_SUB_PAYROLL: payroll-calc-events-worker
+      PUBSUB_SUB_SALES: sales-import-worker
+      PUBSUB_MAX_OUTSTANDING: "20"
+      PUBSUB_NUM_GOROUTINES: "4"
+
+      FIRESTORE_EMULATOR_HOST: firestore-emulator:8086
+      FIRESTORE_COLLECTION: api_request_statuses
+      STATUS_DRIVER: firestore
+
+      DB_MAX_OPEN_CONNS: "4"
+      DB_MAX_OPEN_SCHEMAS: "8"
+
+      TENANTS_JSON: *tenant-registry
+      HTTP_ADDR: ":8081"
+      POD_NAME: worker-local
+    ports:
+      - "8081:8081"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      pubsub-init:
+        condition: service_completed_successfully
+      firestore-emulator:
+        condition: service_started
+    # Scale the pool the way the HPA would: docker compose up -d --scale worker=3
+    deploy:
+      replicas: 1
+
+  ##################################################################
+  # One-shot tools (profile: tools, so they do not start with `up`)
+  ##################################################################
+  migrate:
+    build:
+      context: ./web-api
+    profiles: ["tools"]
+    environment:
+      <<: *db-env
+      APP_ENV: local
+      APP_KEY: base64:RED6Ged84lgnWPYitrlp2BeWgka3/uUJ6QagCcH/nXI=
+      LOG_CHANNEL: stderr
+      DB_CONNECTION: mysql
+      DB_DATABASE: tenant_acme
+      CACHE_DRIVER: array
+      SESSION_DRIVER: array
+      TENANTS_JSON: *tenant-registry
+      GOOGLE_CLOUD_PROJECT: local-dev
+      PUBSUB_DRIVER: log
+      FIRESTORE_DRIVER: "null"
+    entrypoint: ["php", "artisan"]
+    command: ["tenants:migrate", "--seed"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # Deliberately no "test" service here: the web-api image installs
+  # --no-dev, so phpunit is not in it. Tests run on the host (make test) and in CI
+  # against a dev install. Shipping a test runner inside the production image would
+  # mean shipping the dev dependency tree with it.
+
+volumes:
+  mysql-data:
+  frontend-dist:
+  frontend-node-modules:

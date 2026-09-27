@@ -1,0 +1,240 @@
+{
+  "title": "Sequifi - Async Pipeline",
+  "uid": "sequifi-async",
+  "tags": ["sequifi", "worker", "pubsub"],
+  "timezone": "utc",
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "description": "The path a payroll request takes: accepted by the web tier, queued in Pub/Sub, processed by the Go worker, committed to Cloud SQL. Ordered so a reader follows the request rather than the infrastructure.",
+  "panels": [
+    {
+      "type": "row",
+      "title": "1. Queue - is work waiting?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Undelivered messages per subscription",
+      "description": "The signal the worker HPA scales on. A rising line that the pool is not flattening means the autoscaler is not keeping up - or cannot see the backlog because the metrics adapter is down.",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": ["metric.type", "=", "pubsub.googleapis.com/subscription/num_undelivered_messages"],
+            "groupBys": ["resource.label.subscription_id"],
+            "crossSeriesReducer": "REDUCE_MAX",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest unacked message age",
+      "description": "More informative than message count: a big backlog draining fast is fine, a small one that is not moving means the pool is wedged. This is what the queue-not-draining page fires on.",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": ["metric.type", "=", "pubsub.googleapis.com/subscription/oldest_unacked_message_age"],
+            "groupBys": ["resource.label.subscription_id"],
+            "crossSeriesReducer": "REDUCE_MAX",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 300 },
+              { "color": "red", "value": 900 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Dead-letter queue depth",
+      "description": "Must be zero. Anything above it means work has been ABANDONED after exhausting its retries - a tenant's payroll will never complete and nobody has been told.",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 9 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": [
+              "metric.type", "=", "pubsub.googleapis.com/subscription/num_undelivered_messages",
+              "AND", "resource.label.subscription_id", "=", "worker-dead-letter-inspect"
+            ],
+            "crossSeriesReducer": "REDUCE_MAX",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "2. Worker - is work completing?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput and outcomes",
+      "description": "Completed, duplicate, nacked and permanently failed. Duplicates are expected - Pub/Sub is at-least-once and the idempotency guard absorbs them; a HIGH duplicate rate means acks are not landing.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "expr": "sum(rate(worker_messages_completed_total[5m]))", "legendFormat": "completed" },
+        { "expr": "sum(rate(worker_messages_duplicate_total[5m]))", "legendFormat": "duplicate (skipped)" },
+        { "expr": "sum(rate(worker_messages_failed_total[5m]))", "legendFormat": "nacked (retrying)" },
+        { "expr": "sum(rate(worker_messages_permanent_failed_total[5m]))", "legendFormat": "permanent failure" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "stacking": { "mode": "normal" } } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Handler duration by event type",
+      "description": "Payroll and sales imports have different cost profiles. A payroll run over thousands of employees is one message that takes seconds; a sales import is one message with thousands of rows.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        { "expr": "sequifi:worker_mean_duration_ms", "legendFormat": "{{event_type}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Lease saturation vs pool size",
+      "description": "In-flight approaching pods x PUBSUB_MAX_OUTSTANDING means every pod is at its lease limit and the HPA should be adding capacity. If replicas are already at maxReplicas, the ceiling is the constraint.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 23 },
+      "targets": [
+        { "expr": "sequifi:worker_inflight:sum", "legendFormat": "messages in flight" },
+        { "expr": "count(up{job=~\".*worker.*\"} == 1) * 20", "legendFormat": "lease capacity" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tenant connection pools",
+      "description": "Open pools against the LRU cap, plus eviction rate. Constant eviction means DB_MAX_OPEN_SCHEMAS is too low and every message pays a reconnect - but raising it consumes Cloud SQL connections, which is the worse failure.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 23 },
+      "targets": [
+        { "expr": "sum(worker_tenant_pools_open)", "legendFormat": "open pools" },
+        { "expr": "sum(worker_tenant_pools_max)", "legendFormat": "cap" },
+        { "expr": "sum(rate(worker_tenant_pool_evictions_total[5m])) * 60", "legendFormat": "evictions/min" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "3. Edge and API",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate by response class",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": ["metric.type", "=", "loadbalancing.googleapis.com/https/request_count"],
+            "groupBys": ["metric.label.response_code_class"],
+            "crossSeriesReducer": "REDUCE_SUM",
+            "perSeriesAligner": "ALIGN_RATE"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Edge latency percentiles",
+      "description": "Async writes should sit near 150ms: the web tier validates, publishes and returns. A rising p95 on POSTs usually means Pub/Sub publish latency, not application slowness.",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": ["metric.type", "=", "loadbalancing.googleapis.com/https/total_latencies"],
+            "crossSeriesReducer": "REDUCE_PERCENTILE_95",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "row",
+      "title": "4. Data tier",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cloud SQL connections",
+      "description": "Grows with pods x tenants because the worker holds a pool per tenant schema. When this hits the limit EVERY tenant fails at once, including the ones behaving perfectly - which is why the warning fires at 75%.",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": ["metric.type", "=", "cloudsql.googleapis.com/database/mysql/connections"],
+            "crossSeriesReducer": "REDUCE_MAX",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memorystore memory usage",
+      "description": "Holds sessions AND idempotency claims. Eviction under pressure signs users out and, worse, can lose an in-flight idempotency claim - which is how a client retry turns into a duplicate payroll run.",
+      "datasource": { "type": "stackdriver", "uid": "google-cloud-monitoring" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        {
+          "queryType": "timeSeriesList",
+          "timeSeriesList": {
+            "projectName": "PROJECT_ID",
+            "filters": ["metric.type", "=", "redis.googleapis.com/stats/memory/usage_ratio"],
+            "crossSeriesReducer": "REDUCE_MAX",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1 } }
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

@@ -1,0 +1,12 @@
+{
+  "acme": {
+    "name": "Acme Corp (dev)",
+    "database": "tenant_acme",
+    "domain": "acme.dev.sequifi.com"
+  },
+  "whiteknight": {
+    "name": "White Knight (dev)",
+    "database": "tenant_whiteknight",
+    "domain": "whiteknight.dev.sequifi.com"
+  }
+}

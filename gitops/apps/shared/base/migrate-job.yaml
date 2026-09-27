@@ -1,0 +1,101 @@
+####################################################################
+# Tenant schema migration, as an ArgoCD PreSync hook.
+#
+# Runs before the Rollouts are updated, so a revision that expects a new column never
+# starts against a schema that lacks it.
+#
+# Migrations must stay ADDITIVE for this to be safe: add nullable columns, backfill,
+# then switch reads in a later release. During a canary the old and new revisions run
+# side by side against ONE schema, so a destructive migration breaks the revision that
+# is still serving most of the traffic.
+####################################################################
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tenants-migrate
+  namespace: sequifi
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # Replace the previous Job rather than failing because the name exists.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app: tenants-migrate
+    spec:
+      serviceAccountName: web-api
+      restartPolicy: Never
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args:
+            - "--private-ip"
+            - "--structured-logs"
+            - "--port=3306"
+            - "$(CLOUDSQL_INSTANCE)"
+          env:
+            - name: CLOUDSQL_INSTANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: CLOUDSQL_INSTANCE
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+      containers:
+        - name: migrate
+          image: web-api # replaced by kustomize
+          # Skip the web entrypoint, which warms HTTP caches; run artisan directly.
+          command: ["php", "artisan"]
+          args: ["tenants:migrate", "--force"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            # The Job must not depend on Memorystore and must not publish anything.
+            - name: CACHE_DRIVER
+              value: "array"
+            - name: SESSION_DRIVER
+              value: "array"
+            - name: PUBSUB_DRIVER
+              value: "log"
+            - name: FIRESTORE_DRIVER
+              value: "null"
+          securityContext:
+            runAsUser: 82
+            runAsGroup: 82
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

@@ -1,0 +1,159 @@
+####################################################################
+# Promote an already-built image to production.
+#
+# Separate from CI on purpose. CI proves an artefact is good; this decides that a
+# specific proven artefact goes to production. Keeping them apart means:
+#
+#   - production is never deployed as a side effect of merging
+#   - the approval gate has something concrete to approve (a tag that already exists in
+#     Artifact Registry and already runs in dev)
+#   - a rollback is running this workflow with an older tag, not reverting a merge
+####################################################################
+name: Release to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to promote (short git SHA, must already be in Artifact Registry)"
+        required: true
+        type: string
+      skip_dev_check:
+        description: "Promote without requiring the tag to be running in dev (emergency only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev
+  REPOSITORY: sequifi
+
+jobs:
+  verify:
+    name: Verify the artefact
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Confirm both images exist
+        # Promoting a tag that was never built produces an ImagePullBackOff several
+        # minutes later, after ArgoCD has already started the rollout.
+        run: |
+          for image in web-api worker; do
+            ref="${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPOSITORY }}/${image}:${{ inputs.tag }}"
+
+            if ! gcloud artifacts docker images describe "${ref}" >/dev/null 2>&1; then
+              echo "::error::${ref} does not exist. Was it built by CI?"
+              exit 1
+            fi
+
+            echo "found ${ref}"
+          done
+
+      - name: Confirm the tag is already running in dev
+        if: ${{ !inputs.skip_dev_check }}
+        # Production should not be the first environment an artefact reaches. This is a
+        # soft gate with an explicit override, because there are real emergencies.
+        run: |
+          running="$(grep -A1 'sequifi/web-api' gitops/apps/overlays/dev/kustomization.yaml \
+            | grep newTag | awk '{print $2}')"
+
+          if [[ "${running}" != "${{ inputs.tag }}" ]]; then
+            echo "::error::dev is running '${running}', not '${{ inputs.tag }}'."
+            echo "Promote to dev first, or re-run with skip_dev_check for an emergency."
+            exit 1
+          fi
+
+          echo "dev is running ${{ inputs.tag }}"
+
+  promote:
+    name: Promote
+    runs-on: ubuntu-latest
+    needs: [verify]
+    # A protected environment with required reviewers. This is the approval gate; the
+    # job blocks here until somebody signs off.
+    environment:
+      name: production
+      url: https://acme.sequifi.com
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Point the prod overlay at the approved tag
+        working-directory: gitops/apps/overlays/prod
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+          tag = "${{ inputs.tag }}"
+          path = pathlib.Path("kustomization.yaml")
+          text = path.read_text()
+          text = re.sub(r"(sequifi/web-api\n    newTag: )\S+", rf"\g<1>{tag}", text)
+          text = re.sub(r"(sequifi/worker\n    newTag: )\S+", rf"\g<1>{tag}", text)
+          path.write_text(text)
+          PY
+
+          git diff --stat
+
+      - name: Commit
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "prod is already on ${{ inputs.tag }}"
+            exit 0
+          fi
+
+          git commit -am "release(prod): ${{ inputs.tag }}"
+          git tag -a "prod-${{ inputs.tag }}" -m "Production release ${{ inputs.tag }}"
+          git push --follow-tags
+
+      - name: What happens next
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Rollout in progress
+
+          ArgoCD will sync within ~3 minutes, then Argo Rollouts begins the canary:
+
+          | Step | Traffic | Duration |
+          |------|---------|----------|
+          | 1 | 5%  | 2 min + analysis |
+          | 2 | 25% | 5 min + analysis |
+          | 3 | 50% | **manual approval** |
+          | 4 | 100% | - |
+
+          Analysis (success rate >= 98%, p95 <= 1000ms) runs continuously and aborts the
+          rollout automatically if the canary degrades.
+
+          Watch it:
+          ```
+          kubectl argo rollouts get rollout web-api -n sequifi --watch
+          ```
+
+          Promote past the manual gate:
+          ```
+          kubectl argo rollouts promote web-api -n sequifi
+          ```
+
+          Abort:
+          ```
+          kubectl argo rollouts abort web-api -n sequifi
+          ```
+
+          To roll back, re-run this workflow with the previous tag. Reverting the commit
+          works too, but an explicit promotion is clearer in the audit trail.
+          EOF

@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sequifi
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: sequifi
+      app.kubernetes.io/name: web-api
+
+resources:
+  - serviceaccount.yaml
+  - rollout.yaml
+  - service.yaml
+  - hpa.yaml
+  - analysis-templates.yaml
+  - networkpolicy.yaml
+
+configMapGenerator:
+  # nginx.conf lives as a real file rather than inline YAML so it can be linted and
+  # diffed like configuration instead of like a string.
+  - name: nginx-conf
+    files:
+      - nginx.conf=files/nginx.conf
+
+generatorOptions:
+  # Hash suffixes are what make a config change roll the pods. Disabling them is the
+  # usual cause of "I changed the ConfigMap and nothing happened".
+  disableNameSuffixHash: false
+
+images:
+  - name: web-api
+    newName: REGION-docker.pkg.dev/PROJECT_ID/sequifi/web-api
+    newTag: latest

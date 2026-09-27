@@ -1,0 +1,50 @@
+# Headless service purely so Prometheus can discover /metrics. It carries no
+# application traffic - the worker has no inbound API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-metrics
+  labels:
+    app: worker
+spec:
+  clusterIP: None
+  selector:
+    app: worker
+  ports:
+    - name: probe
+      port: 8081
+      targetPort: probe
+---
+# Managed Service for Prometheus scrape config. The same metrics feed the Argo
+# Rollouts analysis that decides whether a worker canary is healthy, so a broken
+# scrape makes every rollout fail its analysis rather than silently losing graphs.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: worker
+spec:
+  selector:
+    matchLabels:
+      app: worker
+  endpoints:
+    - port: probe
+      interval: 30s
+      path: /metrics
+---
+# Self-hosted Prometheus (kube-prometheus-stack) needs its own selector. Both are
+# present because the Rollouts analysis queries the in-cluster Prometheus while
+# long-term retention and alerting live in Cloud Monitoring.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: worker
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: worker
+  endpoints:
+    - port: probe
+      interval: 30s
+      path: /metrics

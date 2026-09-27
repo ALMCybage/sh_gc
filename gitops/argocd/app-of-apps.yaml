@@ -1,0 +1,40 @@
+####################################################################
+# The single Application that creates every other Application.
+#
+# Apply this one manifest and ArgoCD builds the rest of itself from Git. That is the
+# property worth having: cluster state is reproducible from the repository, and
+# recovering a cluster is `kubectl apply -f app-of-apps.yaml` rather than a runbook of
+# twenty helm commands in the right order.
+#
+#   kubectl apply -f gitops/argocd/project.yaml
+#   kubectl apply -f gitops/argocd/app-of-apps.yaml
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sequifi-root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-platform
+
+  source:
+    repoURL: https://github.com/your-org/sequifi.git
+    targetRevision: main
+    path: gitops/argocd/applications
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # Removes Applications deleted from Git, rather than leaving orphans running.
+      prune: true
+      # Reverts manual kubectl changes. This is the whole point of GitOps: the cluster
+      # matches the repository, and a hotfix applied by hand is reverted within
+      # minutes so it has to be committed instead.
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

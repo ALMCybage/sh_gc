@@ -1,0 +1,43 @@
+# Copy to terraform.tfvars and fill in. Never commit the real file.
+#
+# Secrets are better supplied out of band than written here at all:
+#   export TF_VAR_pagerduty_service_key="$(gcloud secrets versions access latest --secret=pagerduty-key)"
+#   export TF_VAR_slack_webhook_url="$(gcloud secrets versions access latest --secret=slack-webhook)"
+
+project_id  = "my-gcp-project-prod"
+region      = "us-central1"
+base_domain = "sequifi.com"
+
+# The tenant registry. This is the source of truth: it produces the Cloud SQL
+# schemas, the URL map host rules, the certificate SANs and the TENANTS_JSON both
+# services read. Adding a tenant here + apply + DNS + tenants:migrate is the whole
+# onboarding process.
+tenants = {
+  acme        = { name = "Acme Corp", schema = "tenant_acme" }
+  whiteknight = { name = "White Knight", schema = "tenant_whiteknight" }
+  frdm        = { name = "FRDM", schema = "tenant_frdm" }
+}
+
+# REQUIRED. An unrestricted control plane endpoint has only IAM in front of it, and
+# 0.0.0.0/0 is rejected by a variable validation.
+master_authorized_networks = [
+  { cidr_block = "203.0.113.0/24", display_name = "office egress" },
+  { cidr_block = "198.51.100.0/28", display_name = "ci runners" },
+]
+
+# REQUIRED. Without it no [PAGE] alert policy is created, and prod would look
+# healthy right up until the first incident.
+# pagerduty_service_key = "set via TF_VAR_pagerduty_service_key"
+
+# slack_webhook_url = "set via TF_VAR_slack_webhook_url"
+ops_email        = "platform-oncall@example.com"
+runbook_base_url = "https://github.com/your-org/sequifi/blob/main/docs/runbook"
+
+# Per-namespace cost attribution, which is how "what does tenant growth cost" gets
+# answered. Create the dataset first.
+# usage_export_dataset = "gke_usage"
+
+github_repository = "your-org/sequifi"
+
+# Populated on the SECOND apply; see bootstrap/README.md for the ordering.
+api_neg_self_links = []

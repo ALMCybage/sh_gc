@@ -1,0 +1,17 @@
+{
+  "acme": {
+    "name": "Acme Corp",
+    "database": "tenant_acme",
+    "domain": "acme.sequifi.com"
+  },
+  "whiteknight": {
+    "name": "White Knight",
+    "database": "tenant_whiteknight",
+    "domain": "whiteknight.sequifi.com"
+  },
+  "frdm": {
+    "name": "FRDM",
+    "database": "tenant_frdm",
+    "domain": "frdm.sequifi.com"
+  }
+}

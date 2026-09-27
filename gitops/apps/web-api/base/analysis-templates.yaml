@@ -1,0 +1,141 @@
+####################################################################
+# What makes the canary automatic.
+#
+# Without these the rollout is just a slower manual deploy: it would advance on a
+# timer regardless of whether the new revision works. These templates query
+# Prometheus for the canary pods specifically and abort the rollout the moment the
+# new revision looks worse than the old one - usually within two minutes, and long
+# before anyone is paged.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: web-api-success-rate
+spec:
+  args:
+    - name: canary-service
+    - name: namespace
+
+  metrics:
+    - name: success-rate
+      # Wait for enough traffic to reach the canary before judging it. Measuring
+      # immediately would evaluate a handful of requests, where one health-check
+      # blip reads as a 100% failure rate.
+      initialDelay: 60s
+      interval: 30s
+
+      # Three consecutive failures aborts. One is noise (a pod restarting, a probe
+      # timing out); three in a row is a pattern.
+      failureLimit: 3
+      # A single measurement below the floor is fatal regardless of the count.
+      consecutiveErrorLimit: 3
+
+      successCondition: result[0] >= 0.98
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring.svc.cluster.local:9090
+          query: |
+            sum(
+              rate(nginx_http_requests_total{
+                namespace="{{args.namespace}}",
+                service="{{args.canary-service}}",
+                status!~"5.."
+              }[2m])
+            )
+            /
+            sum(
+              rate(nginx_http_requests_total{
+                namespace="{{args.namespace}}",
+                service="{{args.canary-service}}"
+              }[2m])
+            )
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: web-api-latency
+spec:
+  args:
+    - name: canary-service
+    - name: namespace
+
+  metrics:
+    - name: p95-latency-ms
+      initialDelay: 60s
+      interval: 30s
+      failureLimit: 3
+
+      # 1000ms at p95. The async design means writes return in ~150ms, so this is
+      # generous: crossing it means something is genuinely slow, not merely busy.
+      successCondition: result[0] <= 1000
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.95,
+              sum(rate(nginx_http_request_duration_seconds_bucket{
+                namespace="{{args.namespace}}",
+                service="{{args.canary-service}}"
+              }[2m])) by (le)
+            ) * 1000
+---
+####################################################################
+# Worker analysis.
+#
+# The worker takes no HTTP traffic, so success rate and latency are meaningless. What
+# matters is whether it is actually completing work: a revision that starts, passes
+# its probes, and then fails every message it leases would sail through any
+# request-based check.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: worker-processing-health
+spec:
+  args:
+    - name: namespace
+
+  metrics:
+    - name: permanent-failure-rate
+      # Longer delay than the web tier: the worker has to be given time to lease and
+      # process messages before there is anything to measure.
+      initialDelay: 120s
+      interval: 60s
+      failureLimit: 2
+
+      # Permanent failures mean the worker is rejecting work it should be doing -
+      # typically a schema expectation the new revision has and the database does not.
+      successCondition: result[0] <= 0.05
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(worker_messages_permanent_failed_total{namespace="{{args.namespace}}"}[5m]))
+            or vector(0)
+
+    - name: completion-rate
+      initialDelay: 120s
+      interval: 60s
+      failureLimit: 2
+
+      # At least 90% of what it leases must complete. Catches the case where the new
+      # revision nacks everything: nothing errors visibly, the queue just stops
+      # draining.
+      successCondition: result[0] >= 0.9
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.monitoring.svc.cluster.local:9090
+          query: |
+            (
+              sum(rate(worker_messages_completed_total{namespace="{{args.namespace}}"}[5m]))
+              + sum(rate(worker_messages_duplicate_total{namespace="{{args.namespace}}"}[5m]))
+            )
+            /
+            clamp_min(
+              sum(rate(worker_messages_received_total{namespace="{{args.namespace}}"}[5m])),
+              0.001
+            )

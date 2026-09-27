@@ -1,0 +1,264 @@
+####################################################################
+# kube-prometheus-stack values.
+#
+# Sized for what this cluster actually needs, which is less than the chart's defaults.
+# Retention is deliberately short: Cloud Monitoring owns long-term history, and this
+# Prometheus exists mainly so Argo Rollouts can make canary decisions on fresh data.
+####################################################################
+
+prometheus:
+  prometheusSpec:
+    # 15 days is plenty for canary analysis and short-term debugging. Longer retention
+    # here duplicates Cloud Monitoring at the cost of a bigger disk.
+    retention: 15d
+    retentionSize: 40GB
+
+    replicas: 2
+
+    resources:
+      requests: { cpu: 500m, memory: 2Gi }
+      limits: { cpu: "2", memory: 4Gi }
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: standard-rwo
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+
+    # Pick up ServiceMonitors and rules from any namespace, not only this one. The
+    # worker's ServiceMonitor lives beside the worker, which is where it belongs.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # Every series is labelled with the cluster it came from, so a future
+    # multi-cluster setup does not silently merge two clusters' metrics.
+    externalLabels:
+      cluster: sequifi
+      environment: prod
+
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 2000
+      seccompProfile:
+        type: RuntimeDefault
+
+alertmanager:
+  alertmanagerSpec:
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: standard-rwo
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+  ####################################################################
+  # Routing.
+  #
+  # The rule is: does a human need to act right now?
+  #   critical -> PagerDuty (wakes someone)
+  #   warning  -> Slack     (read in the morning)
+  #   info     -> Slack, low-noise channel
+  #
+  # Cloud Monitoring has its own copy of the paging policies (Terraform). That
+  # duplication is deliberate: if the cluster is the thing that is broken, in-cluster
+  # Alertmanager cannot tell anyone, and Cloud Monitoring is outside the failure
+  # domain.
+  ####################################################################
+  config:
+    global:
+      resolve_timeout: 5m
+      slack_api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook-url
+
+    route:
+      # Group by alertname AND tenant, so one tenant's problem does not suppress the
+      # notification for another tenant hitting the same alert.
+      group_by: ["alertname", "namespace", "tenant_id"]
+      group_wait: 30s
+      group_interval: 5m
+      # Do not re-notify for 4 hours. Shorter and an unresolved incident becomes noise
+      # that people mute.
+      repeat_interval: 4h
+      receiver: slack-warnings
+
+      routes:
+        # Watchdog proves the alerting pipeline itself is alive. Routed to a black
+        # hole here and monitored externally (a dead-man's switch): if it stops
+        # arriving, alerting is broken and no other alert can tell you.
+        - matchers: ["alertname = Watchdog"]
+          receiver: watchdog
+          group_wait: 0s
+          repeat_interval: 5m
+
+        - matchers: ["severity = critical"]
+          receiver: pagerduty
+          continue: true
+
+        # Criticals also go to Slack, so the team sees what on-call was paged for.
+        - matchers: ["severity = critical"]
+          receiver: slack-critical
+
+        - matchers: ["severity = warning"]
+          receiver: slack-warnings
+
+        - matchers: ["severity = info"]
+          receiver: slack-info
+
+    inhibit_rules:
+      # If the whole worker pool is down, do not also page about queue depth: one
+      # cause, one page.
+      - source_matchers: ["alertname = WorkerPoolDown"]
+        target_matchers: ["alertname =~ QueueNotDraining|WorkerHighFailureRate"]
+        equal: ["namespace"]
+
+      # A critical suppresses the warning for the same alert.
+      - source_matchers: ["severity = critical"]
+        target_matchers: ["severity = warning"]
+        equal: ["alertname", "namespace"]
+
+    receivers:
+      - name: watchdog
+
+      - name: pagerduty
+        pagerduty_configs:
+          - service_key_file: /etc/alertmanager/secrets/alertmanager-pagerduty/service-key
+            severity: critical
+            description: "{{ .CommonAnnotations.summary }}"
+            details:
+              alertname: "{{ .CommonLabels.alertname }}"
+              namespace: "{{ .CommonLabels.namespace }}"
+              # The runbook link is part of the page. An alert without one is a puzzle
+              # handed to someone who has just been woken up.
+              runbook: "{{ .CommonAnnotations.runbook_url }}"
+              description: "{{ .CommonAnnotations.description }}"
+
+      - name: slack-critical
+        slack_configs:
+          - channel: "#sequifi-incidents"
+            send_resolved: true
+            title: "[CRITICAL] {{ .CommonLabels.alertname }}"
+            text: |
+              {{ range .Alerts }}
+              *{{ .Annotations.summary }}*
+              {{ .Annotations.description }}
+              {{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}{{ end }}
+              {{ end }}
+
+      - name: slack-warnings
+        slack_configs:
+          - channel: "#sequifi-alerts"
+            send_resolved: true
+            title: "[WARN] {{ .CommonLabels.alertname }}"
+            text: |
+              {{ range .Alerts }}
+              *{{ .Annotations.summary }}*
+              {{ .Annotations.description }}
+              {{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}{{ end }}
+              {{ end }}
+
+      - name: slack-info
+        slack_configs:
+          - channel: "#sequifi-noise"
+            send_resolved: false
+            title: "{{ .CommonLabels.alertname }}"
+            text: "{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}"
+
+  # Mounted from Secret Manager by External Secrets, so no webhook or service key is
+  # ever committed.
+  alertmanagerSpec:
+    secrets:
+      - alertmanager-slack
+      - alertmanager-pagerduty
+
+grafana:
+  enabled: true
+  replicas: 1
+
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+  # Credentials come from a Secret, not from values.
+  admin:
+    existingSecret: grafana-admin
+    userKey: username
+    passwordKey: password
+
+  persistence:
+    enabled: true
+    storageClassName: standard-rwo
+    size: 10Gi
+
+  # Dashboards are provisioned from ConfigMaps labelled grafana_dashboard, so they
+  # live in Git and are reviewed like code rather than edited in the UI and lost.
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: ALL
+    datasources:
+      enabled: true
+
+  additionalDataSources:
+    # Cloud Monitoring alongside Prometheus, so one Grafana can show both the
+    # short-retention cluster metrics and the long-retention GCP ones (Cloud SQL,
+    # Pub/Sub, the load balancer) that Prometheus never sees.
+    - name: Google Cloud Monitoring
+      type: stackdriver
+      jsonData:
+        authenticationType: gce
+        defaultProject: PROJECT_ID
+
+  grafana.ini:
+    server:
+      root_url: https://grafana.internal.sequifi.com
+    auth.anonymous:
+      enabled: false
+    users:
+      viewers_can_edit: false
+
+# Autopilot manages the control plane, so these targets do not exist and their
+# ServiceMonitors would sit permanently down - training people to ignore "target down".
+kubeApiServer:
+  enabled: true
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+# Autopilot does not permit the host-level access node-exporter needs.
+nodeExporter:
+  enabled: false
+
+prometheusOperator:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+kubeStateMetrics:
+  enabled: true
+
+defaultRules:
+  create: true
+  rules:
+    # Disabled for the same reason as the ServiceMonitors above: they alert on
+    # components Autopilot hides.
+    etcd: false
+    kubeControllerManager: false
+    kubeScheduler: false
+    kubeProxy: false

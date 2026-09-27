@@ -1,0 +1,47 @@
+# Secrets and local environment
+.env
+*.local.env
+*-key.json
+service-account*.json
+
+# Build output
+/worker-go/worker
+/worker-go/worker.exe
+/web-api/vendor
+/web-api/node_modules
+/web-api/public/build
+
+# Runtime
+/web-api/storage/logs/*.log
+/web-api/storage/framework/cache/data/*
+/web-api/storage/framework/sessions/*
+/web-api/storage/framework/views/*
+/web-api/bootstrap/cache/*.php
+
+# Frontend build output and deps
+/frontend/node_modules
+/frontend/dist
+/frontend/.vite
+
+# Local SQLite tenants created by web-api/dev-sqlite.ps1
+/web-api/database/sqlite/
+
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+backend.hcl
+crash.log
+tfplan
+
+# Rendered manifests
+/gitops/**/rendered/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

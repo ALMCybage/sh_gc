@@ -1,0 +1,61 @@
+####################################################################
+# The HPA targets the Rollout, not a Deployment.
+#
+# Argo Rollouts implements the scale subresource, so the HPA scales the stable
+# ReplicaSet and Rollouts derives the canary count from the step weight. Pointing an
+# HPA at a Deployment that no longer exists is a common and confusing failure: it
+# reports "unable to get metrics" rather than "wrong target".
+####################################################################
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-api
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: web-api
+
+  minReplicas: 3
+  maxReplicas: 30
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+  behavior:
+    scaleUp:
+      # React quickly: traffic across 150+ tenants arrives in bursts at month end.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Slowly. Flapping replicas churn NEG endpoints, and every churn is a window
+      # where the load balancer can send a request to a pod that is going away.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: web-api

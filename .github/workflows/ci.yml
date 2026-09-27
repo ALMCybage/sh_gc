@@ -1,0 +1,330 @@
+####################################################################
+# Test, build, scan, push, and update the GitOps manifests.
+#
+# The pipeline does NOT deploy. It pushes an image and commits a tag change; ArgoCD
+# notices and rolls out. That separation is what makes "what is running" answerable by
+# reading Git rather than by asking a CI system.
+#
+# Authentication is Workload Identity Federation - GitHub's OIDC token exchanged for
+# short-lived GCP credentials. No service-account key is stored as a repository secret,
+# so there is nothing to leak or rotate.
+####################################################################
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  # Cancel superseded PR runs, but never cancel a main build: it may already have
+  # pushed an image, and a half-finished push is worse than a slow queue.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC
+  security-events: write # so Trivy results reach the Security tab
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev
+  REPOSITORY: sequifi
+  GO_VERSION: "1.24"
+  PHP_VERSION: "8.2"
+  NODE_VERSION: "22"
+
+jobs:
+  # ==========================================================================
+  # Tests run in parallel and gate everything downstream.
+  # ==========================================================================
+
+  test-go:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: worker-go/go.sum
+
+      - name: Verify formatting
+        working-directory: worker-go
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: worker-go
+        run: go vet ./...
+
+      - name: Test
+        working-directory: worker-go
+        # -race matters for this service: the worker runs one goroutine per message
+        # against shared connection pools and a shared metrics registry.
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        working-directory: worker-go
+        run: |
+          go tool cover -func=coverage.out | tail -20 >> "$GITHUB_STEP_SUMMARY"
+
+  test-php:
+    name: PHP tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: pdo_sqlite, mbstring, bcmath
+          coverage: none
+
+      - name: Cache Composer
+        uses: actions/cache@v4
+        with:
+          path: web-api/vendor
+          key: composer-${{ hashFiles('web-api/composer.lock') }}
+
+      - name: Install
+        working-directory: web-api
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Audit dependencies
+        working-directory: web-api
+        # Reported, not enforced: Laravel 9 is EOL with open advisories that have no fix
+        # inside ^9.0. Failing the build on something unfixable would just get the step
+        # deleted. The upgrade is tracked separately.
+        run: composer audit --format=plain || true
+
+      - name: Test
+        working-directory: web-api
+        run: vendor/bin/phpunit --testdox
+
+  test-frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck and build
+        working-directory: frontend
+        # `npm run build` runs tsc --noEmit first, so this is the type gate too.
+        run: npm run build
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
+  validate-manifests:
+    name: Manifests and Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform formatting
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Terraform validate
+        run: |
+          for dir in terraform/stack terraform/envs/dev terraform/envs/prod terraform/bootstrap-state; do
+            echo "::group::${dir}"
+            terraform -chdir="${dir}" init -backend=false -input=false
+            terraform -chdir="${dir}" validate
+            echo "::endgroup::"
+          done
+
+      - name: Render Kustomize overlays
+        # Rendering catches the errors that only appear when bases and patches are
+        # combined: a patch targeting a resource that does not exist, a transformer that
+        # does not understand a CRD.
+        run: |
+          for overlay in gitops/apps/overlays/dev gitops/apps/overlays/prod; do
+            echo "::group::${overlay}"
+            kubectl kustomize "${overlay}" > "/tmp/$(basename "${overlay}").yaml"
+            grep -c '^kind:' "/tmp/$(basename "${overlay}").yaml"
+            echo "::endgroup::"
+          done
+
+      - name: Validate rendered manifests against the Kubernetes schema
+        uses: instrumenta/kubeval-action@master
+        with:
+          files: /tmp/prod.yaml
+        continue-on-error: true # CRDs (Rollout, ExternalSecret) have no upstream schema
+
+      - name: Check for committed secrets
+        run: |
+          # A placeholder is fine; a real value is not. Catches the classic mistake of
+          # replacing REPLACE_ME locally and committing it.
+          if grep -rIn --include='*.yaml' --include='*.yml' \
+               -E '(password|secret|token|key)\s*:\s*["'"'"']?[A-Za-z0-9+/]{20,}' \
+               gitops/ deploy/ 2>/dev/null \
+             | grep -viE 'PLACEHOLDER|REPLACE_ME|secretKeyRef|secretName|existingSecret|remoteRef|_FILE|base64:RED6'; then
+            echo "::error::A committed value looks like a real secret."
+            exit 1
+          fi
+          echo "no committed secrets found"
+
+  # ==========================================================================
+  # Build and push. Only on main, only after everything passes.
+  # ==========================================================================
+
+  build:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    needs: [test-go, test-php, test-frontend, validate-manifests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        name: Compute the tag
+        # The git SHA, not `latest`. A deploy has to be traceable to a commit, and
+        # `kubectl rollout undo` has to land on a known image rather than whatever
+        # `latest` points at now.
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          # OIDC federation: no key file. The provider's attribute_condition restricts
+          # this to one repository (see terraform/modules/iam).
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build web-api
+        uses: docker/build-push-action@v6
+        with:
+          context: ./web-api
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPOSITORY }}/web-api:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=web-api
+          cache-to: type=gha,mode=max,scope=web-api
+          provenance: true
+          sbom: true
+
+      - name: Build worker
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker-go
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPOSITORY }}/worker:${{ steps.meta.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.tag }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+          provenance: true
+          sbom: true
+
+      - name: Scan web-api
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPOSITORY }}/web-api:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy-web-api.sarif
+          severity: CRITICAL,HIGH
+          # Only findings with a fix. Unfixable CVEs in a base image are noise that
+          # trains people to ignore the report.
+          ignore-unfixed: true
+
+      - name: Scan worker
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPOSITORY }}/worker:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy-worker.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .
+        continue-on-error: true
+
+  # ==========================================================================
+  # The deploy: a commit, not a kubectl apply.
+  # ==========================================================================
+
+  promote-dev:
+    name: Promote to dev
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Point the dev overlay at the new images
+        working-directory: gitops/apps/overlays/dev
+        run: |
+          sed -i "s|newTag: .*# web|newTag: ${{ needs.build.outputs.tag }} # web|" kustomization.yaml || true
+          # The two image entries are ordered web-api then worker.
+          python3 - <<'PY'
+          import re, pathlib
+          tag = "${{ needs.build.outputs.tag }}"
+          path = pathlib.Path("kustomization.yaml")
+          text = path.read_text()
+          text = re.sub(r"(sequifi/web-api\n    newTag: )\S+", rf"\g<1>{tag}", text)
+          text = re.sub(r"(sequifi/worker\n    newTag: )\S+", rf"\g<1>{tag}", text)
+          path.write_text(text)
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "nothing to promote"
+            exit 0
+          fi
+
+          git commit -am "deploy(dev): ${{ needs.build.outputs.tag }}"
+          git push
+
+      - name: Note
+        run: |
+          echo "ArgoCD will sync dev within ~3 minutes." >> "$GITHUB_STEP_SUMMARY"
+          echo "Production is promoted by the separate release workflow, which requires" >> "$GITHUB_STEP_SUMMARY"
+          echo "an approval on the \`production\` environment." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,37 @@
+# Dev deploys straight through, with no analysis and no pauses.
+#
+# The canary exists to protect users from a bad revision. Dev has no users, and a
+# 12 minute wait to see whether a change works is friction that gets routed around -
+# usually by someone applying manifests by hand, which defeats GitOps entirely.
+#
+# The steps are kept (rather than switching to a rolling update) so dev still
+# exercises the Rollout controller and a mistake in the Rollout spec itself surfaces
+# here rather than in prod.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: web-api
+  namespace: sequifi
+spec:
+  # One replica in dev. Set here rather than through Kustomize's `replicas:`
+  # transformer, which does not understand custom resources.
+  replicas: 1
+  strategy:
+    canary:
+      analysis: null
+      steps:
+        - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: worker
+  namespace: sequifi
+spec:
+  replicas: 1
+  strategy:
+    canary:
+      analysis: null
+      steps:
+        - setCanaryScale:
+            replicas: 1

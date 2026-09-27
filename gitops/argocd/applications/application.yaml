@@ -1,0 +1,109 @@
+####################################################################
+# The application itself.
+#
+# One Application per environment, pointing at the matching Kustomize overlay. CI
+# updates the image tags in that overlay and commits; ArgoCD notices and syncs. There
+# is no `kubectl apply` in the deployment path at all - which means "what is running"
+# is answerable by reading Git.
+####################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sequifi-prod
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    # Slack notifications on sync outcomes. A canary that aborts at 3am should be
+    # visible in the morning without anyone hunting for it.
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: sequifi-deploys
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: sequifi-deploys
+    notifications.argoproj.io/subscribe.on-deployed.slack: sequifi-deploys
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-apps
+
+  source:
+    repoURL: https://github.com/your-org/sequifi.git
+    targetRevision: main
+    path: gitops/apps/overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sequifi
+
+  syncPolicy:
+    automated:
+      prune: true
+      # Reverts drift, including a well-meaning `kubectl edit` during an incident. The
+      # fix has to be committed, which is what keeps Git honest.
+      selfHeal: true
+      # Do not prune on a branch change; a mistyped targetRevision should not delete
+      # production.
+      allowEmpty: false
+
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # Wait for the PreSync migration Job before touching the Rollouts.
+      - PruneLast=true
+
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    # The HPA owns replica counts at runtime. Without this, ArgoCD would see the HPA's
+    # scaling as drift and reset it on every sync - fighting the autoscaler.
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas
+
+    # Argo Rollouts injects the pod-template-hash into the canary/stable Services'
+    # selectors as it shifts traffic. That is the controller doing its job, not drift.
+    - group: ""
+      kind: Service
+      jqPathExpressions:
+        - .spec.selector."rollouts-pod-template-hash"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sequifi-dev
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: sequifi-deploys
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: sequifi-apps
+
+  source:
+    repoURL: https://github.com/your-org/sequifi.git
+    targetRevision: main
+    path: gitops/apps/overlays/dev
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sequifi
+
+  syncPolicy:
+    automated: { prune: true, selfHeal: true, allowEmpty: false }
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas
+    - group: ""
+      kind: Service
+      jqPathExpressions:
+        - .spec.selector."rollouts-pod-template-hash"
